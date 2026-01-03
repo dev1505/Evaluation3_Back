@@ -3,28 +3,18 @@ import os
 from dotenv import load_dotenv
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.http import models as qmodels
-from supabase import Client, create_client
+from supabase import AsyncClient, AsyncClientOptions, create_async_client
 
 load_dotenv()
 
-_db: Client | None = None
-_storage: Client | None = None
+_storage: AsyncClient | None = None
 _vdb = None
 
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
-SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
-QDRANT_URL = os.getenv("QDRANT_URL")
-
-
-def database():
-    global _db
-    _db = create_client(
-        SUPABASE_URL,
-        SUPABASE_ANON_KEY,
-    )
-    return _db
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "")
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+QDRANT_API_KEY = os.environ.get("QDRANT_API_KEY", "")
+QDRANT_URL = os.environ.get("QDRANT_URL", "")
 
 
 async def vector_database():
@@ -68,10 +58,16 @@ async def vector_database():
     return _vdb
 
 
-def storage():
+async def storage():
     global _storage
-    _storage = create_client(
-        SUPABASE_URL,
-        SUPABASE_SERVICE_ROLE_KEY,
+    _storage = await create_async_client(
+        supabase_url=SUPABASE_URL,
+        supabase_key=SUPABASE_SERVICE_ROLE_KEY,
+        options=AsyncClientOptions(
+            schema="public",
+            auto_refresh_token=False,
+            persist_session=False,
+        ),
     )
+
     return _storage

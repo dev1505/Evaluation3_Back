@@ -1,12 +1,11 @@
 from contextlib import asynccontextmanager
 
-from fastapi import APIRouter, Depends, FastAPI, File, Request, UploadFile
+from fastapi import APIRouter, Depends, FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
-from service.dependency import database, storage, vector_database
+from service.db_setup import get_db, init_db
+from service.dependency import storage, vector_database
 from service.file_service import File_Service
-
-# from service.llm_service import
 
 my_resources = {}
 
@@ -15,9 +14,9 @@ my_resources = {}
 async def lifespan(app: FastAPI):
     print("Application starting up...")
     my_resources["database_connection"] = "connected_to_database"
-    database()
-    storage()
+    await storage()
     await vector_database()
+    await init_db()
     print("Database connection established.")
     yield
     print("Application shutting down...")
@@ -47,10 +46,17 @@ app.add_middleware(
 async def upload_file(
     file: UploadFile = File(...),
     store=Depends(storage),
-    db=Depends(database),
+    db=Depends(get_db),
+    chunking_method=str,
     vdb=Depends(vector_database),
 ):
-    return await File_Service.upload_single_file(file=file, store=store, db=db, vdb=vdb)
+    return await File_Service.upload_single_file(
+        file=file,
+        store=store,
+        db=db,
+        vdb=vdb,
+        chunking_method=chunking_method if chunking_method else "SLIDING_WINDOW",  # type: ignore
+    )
 
 
 @router.post("/api/verify-citation")
@@ -70,9 +76,3 @@ async def get_context_output(
 
 
 app.include_router(router)
-# def main():
-#     print("Hello from eval3-back!")
-
-
-# if __name__ == "__main__":
-#     main()

@@ -1,3 +1,4 @@
+from enum import Enum
 import os
 import uuid
 from datetime import datetime, timezone
@@ -7,8 +8,10 @@ from typing import Any, Callable, Dict
 from fastapi import File, HTTPException, UploadFile
 from qdrant_client.http import models as qmodels
 
+from service import chunkings
 from service.chunkings import embed_query, semantic_chunker, sliding_window_chunker
 from service.llm_service import LlmService
+from service.models import UserDocs
 from service.parsers import Parsers
 
 
@@ -118,7 +121,7 @@ class Vectordb_Service:
     async def store_embeddings(
         embedded_chunks,
         vdb,
-        file_name: str,
+        filename: str,
     ):
         if not embedded_chunks:
             return {
@@ -137,7 +140,7 @@ class Vectordb_Service:
                     id=str(uuid.uuid4()),
                     vector=embedding,
                     payload={
-                        "file_name": file_name,
+                        "filename": filename,
                         "document_id": chunk.metadata.document_id,
                         "page_start": chunk.metadata.page_start,
                         "page_end": chunk.metadata.page_end,
@@ -164,17 +167,17 @@ class Vectordb_Service:
         query: str,
         vdb,
         top_k: int = 20,
-        file_name: str | None = None,
+        filename: str | None = None,
     ):
 
         query_vector = embed_query(query)
         search_filter = None
-        if file_name:
+        if filename:
             search_filter = qmodels.Filter(
                 must=[
                     qmodels.FieldCondition(
-                        key="file_name",
-                        match=qmodels.MatchValue(value=file_name),
+                        key="filename",
+                        match=qmodels.MatchValue(value=filename),
                     )
                 ]
             )
@@ -208,8 +211,8 @@ class Vectordb_Service:
                         "document_id": (
                             point.payload.get("document_id") if point.payload else None
                         ),
-                        "file_name": (
-                            point.payload.get("file_name") if point.payload else None
+                        "filename": (
+                            point.payload.get("filename") if point.payload else None
                         ),
                         "page_start": (
                             point.payload.get("page_start") if point.payload else None
@@ -289,7 +292,49 @@ class Vectordb_Service:
         return reranked
 
 
+class ChunkingMethod(Enum):
+    SLIDING_WINDOW = "SLIDING_WINDOW"
+    SEMANTIC_CHUNKING = "SEMANTIC_CHUNKING"
+
+
 class File_Service:
+
+    @staticmethod
+    async def upload_file_info_in_db(data: dict, db):
+        try:
+            async with db.begin():
+                db_data = UserDocs(**data)
+                db.add(db_data)
+                await db.flush()
+            return {
+                "data": "File data in DB",
+                "success": True,
+            }
+
+        except Exception as e:
+            await db.rollback()
+            raise e
+
+    @staticmethod
+    async def upload_file_info_in_store(file: UploadFile, file_info, store):
+        try:
+            bucket_name = "eval_user_docs"
+            await store.storage.from_(bucket_name).upload(
+                path=file_info["id"],
+                file=await file.read(),
+                file_options={
+                    "content-type": file.content_type,
+                    "upsert": False,
+                },
+            )
+
+            return {
+                "success": True,
+                "path": f"{bucket_name}/{file_info["id"]}",
+            }
+
+        except Exception as e:
+            raise ValueError(str(e))
 
     @staticmethod
     async def get_uploaded_file_info(file: UploadFile) -> dict:
@@ -297,12 +342,14 @@ class File_Service:
         size = file.size if file.size else 0
         filename = file.filename if file.filename else ""
         return {
-            "name": file.filename,
+            "id": str(uuid.uuid4()),
+            "filename": file.filename,
             "size_bytes": size,
             "size_kb": round(size / 1024, 2),
             "size_mb": round(size / (1024 * 1024), 2),
             "extension": filename.split(".")[-1],
             "mime_type": mimetype,
+            "uploaded_at": str(datetime.now(timezone.utc)),
         }
 
     @staticmethod
@@ -318,25 +365,53 @@ class File_Service:
         db,
         vdb,
         store,
+        chunking_method: str,
         file: UploadFile = File(...),
     ):
-        print(
-            # await Vectordb_Service.store_embeddings(
-            #     vdb=vdb,
-            #     embedded_chunks=semantic_chunker(
-            #         file_bytes=await file.read(),
-            #         document_id="hello",
-            #         max_chunk_size=200,
-            #         mode="paragraph",
-            #     ),
-            #     file_name=(await File_Service.get_uploaded_file_info(file))["name"],
-            # )
-            await Vectordb_Service.basic_semantic_search(
-                query="gateway promotes the wellbeing of all team members and aids in acheiving?",
-                vdb=vdb,
-                top_k=5,
-            )
+
+        file_info = await File_Service.get_uploaded_file_info(file)
+        file_bytes = await file.read()
+
+        await File_Service.upload_file_info_in_db(
+            data=file_info,
+            db=db,
         )
+
+        await File_Service.upload_file_info_in_store(
+            file=file,
+            file_info=file_info,
+            store=store,
+        )
+
+        if chunking_method == ChunkingMethod.SEMANTIC_CHUNKING:
+            chunks = semantic_chunker(
+                document_id=file_info["id"],
+                file_bytes=file_bytes,
+                max_chunk_size=300,
+                mode="paragraph",
+            )
+            await Vectordb_Service.store_embeddings(
+                filename=file_info["filename"],
+                embedded_chunks=chunks,
+                vdb=vdb,
+            )
+        elif chunking_method == ChunkingMethod.SLIDING_WINDOW:
+            chunks = sliding_window_chunker(
+                chunk_size=100,
+                document_id=file_info["id"],
+                file_bytes=file_bytes,
+                overlap=80,
+            )
+            await Vectordb_Service.store_embeddings(
+                filename=file_info["filename"],
+                embedded_chunks=chunks,
+                vdb=vdb,
+            )
+
+        return {
+            "data": "Info stored DB, File storage and Vector DB along with embeddings",
+            "success": True,
+        }
 
     @staticmethod
     async def get_output_from_llm(query, vdb):
