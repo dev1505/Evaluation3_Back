@@ -1,5 +1,6 @@
 import json
 import os
+from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 from groq import AsyncGroq as groq
@@ -46,6 +47,7 @@ class LlmService:
                     if response.choices[0].message.content
                     else ""
                 ),
+                "response_at": datetime.now(timezone.utc),
                 "success": True,
             }
 

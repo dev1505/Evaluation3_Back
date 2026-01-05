@@ -1,12 +1,13 @@
-from enum import Enum
 import os
 import uuid
 from datetime import datetime, timezone
+from enum import Enum
 from turtle import up
 from typing import Any, Callable, Dict
 
 from fastapi import File, HTTPException, UploadFile
 from qdrant_client.http import models as qmodels
+from sqlalchemy import select
 
 from service import chunkings
 from service.chunkings import embed_query, semantic_chunker, sliding_window_chunker
@@ -134,7 +135,6 @@ class Vectordb_Service:
         for item in embedded_chunks:
             chunk = item["chunk"]
             embedding = item["embedding"]
-
             points.append(
                 qmodels.PointStruct(
                     id=str(uuid.uuid4()),
@@ -300,6 +300,23 @@ class ChunkingMethod(Enum):
 class File_Service:
 
     @staticmethod
+    async def get_all_files(db):
+        try:
+            result = await db.execute(
+                select(UserDocs).order_by(UserDocs.uploaded_at.desc())
+            )
+            files = result.scalars().all()
+
+            return {
+                "success": True,
+                "data": files,
+            }
+
+        except Exception as e:
+            await db.rollback()
+            raise e
+
+    @staticmethod
     async def upload_file_info_in_db(data: dict, db):
         try:
             async with db.begin():
@@ -366,6 +383,7 @@ class File_Service:
         vdb,
         store,
         chunking_method: str,
+        chunking_mode: str,
         file: UploadFile = File(...),
     ):
 
@@ -384,23 +402,32 @@ class File_Service:
         )
 
         if chunking_method == ChunkingMethod.SEMANTIC_CHUNKING:
+            mode = "paragraph"
+            if chunking_mode == "paragraph":
+                mode = "paragraph"
+            elif chunking_mode == "section":
+                mode = "section"
+            elif chunking_mode == "sentence":
+                mode = "sentence"
+            else:
+                mode = "paragraph"
             chunks = semantic_chunker(
                 document_id=file_info["id"],
                 file_bytes=file_bytes,
                 max_chunk_size=300,
-                mode="paragraph",
+                mode=mode,
             )
             await Vectordb_Service.store_embeddings(
                 filename=file_info["filename"],
                 embedded_chunks=chunks,
                 vdb=vdb,
             )
-        elif chunking_method == ChunkingMethod.SLIDING_WINDOW:
+        else:
             chunks = sliding_window_chunker(
-                chunk_size=100,
+                chunk_size=300,
                 document_id=file_info["id"],
                 file_bytes=file_bytes,
-                overlap=80,
+                overlap=100,
             )
             await Vectordb_Service.store_embeddings(
                 filename=file_info["filename"],

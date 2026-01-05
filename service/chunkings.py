@@ -51,27 +51,42 @@ def structural_units(pages: List[str]) -> List[Tuple[str, int, Optional[str]]]:
     current_section: Optional[str] = None
 
     for page_num, page_text in enumerate(pages, start=1):
-        buffer = ""
+        lines = [l.rstrip() for l in page_text.splitlines()]
+        paragraph_lines: List[str] = []
 
-        for line in page_text.splitlines():
+        for line in lines:
+            if not line.strip():
+                if paragraph_lines:
+                    units.append(
+                        (" ".join(paragraph_lines).strip(), page_num, current_section)
+                    )
+                    paragraph_lines = []
+                continue
+
             if HEADER_REGEX.match(line):
-                if buffer.strip():
-                    units.append((buffer.strip(), page_num, current_section))
-                    buffer = ""
+                if paragraph_lines:
+                    units.append(
+                        (" ".join(paragraph_lines).strip(), page_num, current_section)
+                    )
+                    paragraph_lines = []
+
                 current_section = line.strip()
-                buffer += line + "\n"
+                units.append((current_section, page_num, current_section))
+                continue
 
-            elif LIST_ITEM_REGEX.match(line) or TABLE_ROW_REGEX.match(line):
-                buffer += line + "\n"
+            if LIST_ITEM_REGEX.match(line):
+                paragraph_lines.append(line.strip())
+                continue
 
-            elif line.strip() == "":
-                buffer += "\n"
+            if TABLE_ROW_REGEX.match(line):
+                paragraph_lines.append(line.strip())
+                continue
 
-            else:
-                buffer += line + " "
+            # Normal wrapped text line → merge safely
+            paragraph_lines.append(line.strip())
 
-        if buffer.strip():
-            units.append((buffer.strip(), page_num, current_section))
+        if paragraph_lines:
+            units.append((" ".join(paragraph_lines).strip(), page_num, current_section))
 
     return units
 
@@ -84,7 +99,6 @@ def semantic_chunker(
 ) -> List[Dict[str, Any]]:
 
     pages = Parsers.pdf_parser_from_upload(file_bytes=file_bytes)
-
     if not pages:
         return []
 
@@ -96,58 +110,52 @@ def semantic_chunker(
     current_section_path: List[str] = []
     chunk_index = 0
 
-    for text, page, section in units:
-        if section:
-            current_section_path = [section]
+    def flush_chunk():
+        nonlocal current_text, current_pages, chunk_index
+        if not current_text.strip():
+            return
 
-        if mode == "sentence":
-            parts = re.split(r"(?<=[.!?])\s+", text)
-        elif mode == "section":
-            parts = [text]
-        else:
-            parts = re.split(r"\n\s*\n+", text)
-
-        for part in parts:
-            part = part.strip()
-            if not part:
-                continue
-
-            if len(current_text) + len(part) > max_chunk_size and current_text:
-                chunk = Chunk(
-                    text=current_text.strip(),
-                    metadata=ChunkMetadata(
-                        document_id=document_id,
-                        page_start=min(current_pages),
-                        page_end=max(current_pages),
-                        section_path=current_section_path.copy(),
-                        chunk_index=chunk_index,
-                        uploaded_at=datetime.now(timezone.utc),
-                    ),
-                )
-
-                embedded_chunks.append(embed_chunk(chunk))
-                chunk_index += 1
-                current_text = ""
-                current_pages = []
-
-            current_text += "\n" + part
-            current_pages.append(page)
-
-    if current_text.strip():
         chunk = Chunk(
             text=current_text.strip(),
             metadata=ChunkMetadata(
                 document_id=document_id,
                 page_start=min(current_pages),
                 page_end=max(current_pages),
-                section_path=current_section_path,
+                section_path=current_section_path.copy(),
                 chunk_index=chunk_index,
                 uploaded_at=datetime.now(timezone.utc),
             ),
         )
-
         embedded_chunks.append(embed_chunk(chunk))
+        chunk_index += 1
+        current_text = ""
+        current_pages = []
 
+    for text, page, section in units:
+        if section:
+            current_section_path = [section]
+
+        if mode == "section":
+            parts = [text]
+
+        elif mode == "sentence":
+            parts = re.split(r"(?<=[.!?])\s+(?=[A-Z])", text)
+
+        else:
+            parts = [text]
+
+        for part in parts:
+            part = part.strip()
+            if not part:
+                continue
+
+            if current_text and len(current_text) + len(part) > max_chunk_size:
+                flush_chunk()
+
+            current_text += ("\n\n" if current_text else "") + part
+            current_pages.append(page)
+
+    flush_chunk()
     return embedded_chunks
 
 

@@ -17,6 +17,15 @@ class Parsers:
                 "data": Parsers.pdf_parser_from_upload(file_bytes == file_bytes),
                 "success": True,
             }
+        elif (
+            mime_type == "application/msword"
+            or mime_type
+            == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        ):
+            return {
+                "data": Parsers.word_parser_from_upload(file_bytes=file_bytes),
+                "success": True,
+            }
         else:
             return {
                 "data": "File of this type is not supported",
@@ -36,15 +45,6 @@ class Parsers:
                 text = ocr_text
             pages_text.append(text.strip())
         return pages_text
-
-    # @staticmethod
-    # async def image_parser_from_upload(image_bytes) -> str:
-    #     try:
-    #         image = Image.open(io.BytesIO(image_bytes))
-    #         text = pytesseract.image_to_string(image)
-    #         return text.strip()
-    #     except Exception as e:
-    #         raise RuntimeError(f"Failed to parse image: {e}")
 
     @staticmethod
     async def word_parser_from_upload(file_bytes) -> str:
