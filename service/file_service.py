@@ -60,60 +60,53 @@ def safe_supabase_storage_action(action: Callable[[], Any]) -> Dict[str, Any]:
         )
 
 
-# semantic_chunks = semantic_chunker(
-#     file_bytes=file_bytes,
-#     max_chunk_size=1200,
-#     mode="paragraph"
-# )
-
-# window_chunks = sliding_window_chunker(
-#     file_bytes=file_bytes,
-#     chunk_size=1000,
-#     overlap=200
-# )
-
-
 def parse_uploaded_at(ts: str) -> datetime:
+    if not ts:
+        return datetime.min.replace(tzinfo=timezone.utc)
     return datetime.fromisoformat(ts.replace("Z", "+00:00"))
 
 
-def recency_score(uploaded_at_iso: str, now: datetime) -> float:
-    uploaded_at = parse_uploaded_at(uploaded_at_iso)
-    age_seconds = (now - uploaded_at).total_seconds()
-    return 1.0 / (1.0 + age_seconds)
-
-
-IMPORTANT_SECTIONS = {"definition", "definitions", "overview", "introduction"}
-
-
-def adjacency_score(
-    chunk_index: int,
-    relevant_indices: set[int],
+def recency_score(
+    uploaded_at_iso: str,
+    now: datetime,
+    half_life_hours: float = 72.0,
 ) -> float:
-    if chunk_index - 1 in relevant_indices:
-        return 0.5
-    if chunk_index + 1 in relevant_indices:
-        return 0.5
-    return 0.0
+    try:
+        uploaded_at = parse_uploaded_at(uploaded_at_iso)
+        age_hours = (now - uploaded_at).total_seconds() / 3600.0
 
+        if age_hours <= 0:
+            return 1.0
 
-def final_score(
-    similarity: float,
-    recency: float,
-    hierarchy: float,
-    adjacency: float,
-    W1=0.55,
-    W2=0.20,
-    W3=0.15,
-    W4=0.10,
-) -> float:
-    return similarity * W1 + recency * W2 + hierarchy * W3 + adjacency * W4
+        return 0.5 ** (age_hours / half_life_hours)
+    except Exception:
+        return 0.0
 
 
 def hierarchy_score(section_path: list[str]) -> float:
+    if not section_path:
+        return 0.0
+    IMPORTANT_SECTIONS = {
+        "definition",
+        "definitions",
+        "overview",
+        "introduction",
+        "summary",
+    }
     for section in section_path:
-        if section.lower() in IMPORTANT_SECTIONS:
+
+        clean = str(section).lower().strip(": ").split()
+        if clean and clean[0] in IMPORTANT_SECTIONS:
             return 1.0
+    return 0.0
+
+
+def adjacency_score(chunk_index: int, relevant_indices: set[int]) -> float:
+    if not chunk_index:
+        return 0.0
+
+    if (chunk_index - 1) in relevant_indices or (chunk_index + 1) in relevant_indices:
+        return 1.0
     return 0.0
 
 
@@ -166,7 +159,7 @@ class Vectordb_Service:
     async def basic_semantic_search(
         query: str,
         vdb,
-        top_k: int = 20,
+        top_k: int = 30,
         filename: str | None = None,
     ):
 
@@ -254,42 +247,48 @@ class Vectordb_Service:
     async def rerank_chunks(
         retrieved_chunks: list[dict],
         now: datetime | None = None,
+        top_n: int = 5,
     ) -> list[dict]:
+        if not retrieved_chunks:
+            return []
         if not now:
             now = datetime.now(timezone.utc)
 
-        top_similar = sorted(
-            retrieved_chunks,
-            key=lambda x: x["score"],
-            reverse=True,
-        )[:5]
-
-        relevant_indices = {c["chunk_index"] for c in top_similar}
+        scores = [c["score"] for c in retrieved_chunks]
+        max_s = max(scores)
+        min_s = min(scores)
+        s_range = max_s - min_s if max_s != min_s else 1.0
+        similarity_sorted = sorted(
+            retrieved_chunks, key=lambda x: x["score"], reverse=True
+        )
+        adjacency_anchors = {
+            c["chunk_index"]
+            for c in similarity_sorted[:5]
+            if c.get("chunk_index") is not None
+        }
 
         reranked = []
-
         for chunk in retrieved_chunks:
-            sim = chunk["score"]
-            rec = recency_score(chunk["uploaded_at"], now)
-            hier = hierarchy_score(chunk["section_path"])
-            adj = adjacency_score(chunk["chunk_index"], relevant_indices)
+            sim_norm = (chunk["score"] - min_s) / s_range
 
-            score = final_score(
-                similarity=sim,
-                recency=rec,
-                hierarchy=hier,
-                adjacency=adj,
-            )
+            rec = recency_score(chunk["uploaded_at"], now, half_life_hours=48.0)
+            hier = hierarchy_score(chunk["text"])
+            adj = adjacency_score(chunk["chunk_index"], adjacency_anchors)
+
+            f_score = (sim_norm * 0.45) + (rec * 0.35) + (hier * 0.10) + (adj * 0.10)
 
             reranked.append(
                 {
                     **chunk,
-                    "final_score": score,
+                    "norm_similarity": sim_norm,
+                    "recency_factor": rec,
+                    "final_score": f_score,
                 }
             )
 
         reranked.sort(key=lambda x: x["final_score"], reverse=True)
-        return reranked
+        print(reranked[:8])
+        return await File_Service.get_citations_from_chunks(chunks=reranked[:top_n])
 
 
 class ChunkingMethod(Enum):
@@ -370,11 +369,25 @@ class File_Service:
         }
 
     @staticmethod
+    async def get_citations_from_chunks(chunks):
+        citations = []
+        for chunk in chunks:
+            citations.append(
+                {
+                    **chunk,
+                    "citation": await LlmService.get_citations_from_chunk_output(
+                        chunk=chunk
+                    ),
+                }
+            )
+        return citations
+
+    @staticmethod
     async def get_document_citations(query, vdb):
         return await Vectordb_Service.basic_semantic_search(
             query=query,
             vdb=vdb,
-            top_k=5,
+            top_k=30,
         )
 
     @staticmethod
@@ -445,7 +458,7 @@ class File_Service:
         reranked_list = await Vectordb_Service.basic_semantic_search(
             query=query,
             vdb=vdb,
-            top_k=5,
+            top_k=30,
         )
         return await LlmService.get_structured_reranked_output(
             reranked_data=reranked_list,
